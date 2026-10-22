@@ -1,17 +1,20 @@
 # =====================================================
-# DEVILS WILL RISE - VISIT API
+# DEVILS WILL RISE - VISIT API (FULL FAST)
 # OWNER   : @kamod_codex
 # CHANNEL : @kamod_codex
 # 💀 KAMOD WILL RISE 💀
 # =====================================================
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import aiohttp
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
+import uuid
 import requests
+import collections
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from byte import encrypt_api, Encrypt_ID
 from visit_count_pb2 import Info
@@ -19,51 +22,84 @@ from visit_count_pb2 import Info
 app = Flask(__name__)
 
 # ================= CONFIG =================
-REFRESH_INTERVAL = 21600   # 6 hours
-THREAD_COUNT = 30          # 30 threads
-BATCH_DELAY = 1          # batch ke baad delay
-FETCH_RETRY = 2            # fail pe retry
-RETRY_DELAY = 3            # retry se pehle delay
+REFRESH_INTERVAL   = 21600     # 6 hours
+THREAD_COUNT       = 30        # JWT fetch threads
+BATCH_DELAY        = 1.5
+FETCH_RETRY        = 2
+RETRY_DELAY        = 3
 
-INPUT_VISIT = "account.json"
+# 🔥 FAST visit tuning
+VISIT_CONCURRENCY  = 800       # max parallel in-flight
+VISIT_BATCH_SIZE   = 2000      # not strictly needed with worker pool but kept
+VISIT_TIMEOUT      = aiohttp.ClientTimeout(total=15, connect=5)
+CONN_KEEPALIVE     = 60
+
+DEFAULT_TARGET     = 2000
+
+INPUT_VISIT  = "account.json"
 OUTPUT_VISIT = "token_ind.json"
 
 JWT_API_URLS = [
-    "https://kamodjwt.vercel.app/token",
     "https://all-in-one-jwt.vercel.app/token",
 ]
+
+START_TIME = time.time()
 # ==========================================
 
 
-# ================= JWT FETCH (with retry + fallback) =================
+# ================= GLOBAL STATE =================
+STATE_LOCK = threading.Lock()
+JOBS = {}   # job_id -> dict
+
+REFRESH_INFO = {
+    "last_start": None,
+    "last_end": None,
+    "success": 0,
+    "failed": 0,
+    "total": 0,
+}
+
+LOG_BUFFER = collections.deque(maxlen=200)
+LOG_LOCK = threading.Lock()
+
+def log(msg):
+    ts = time.strftime('%H:%M:%S')
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    with LOG_LOCK:
+        LOG_BUFFER.append(line)
+# ================================================
+
+
+# ================= JWT FETCH =================
 def fetch_jwt(uid, password, retries=FETCH_RETRY):
     for attempt in range(retries + 1):
         for base_url in JWT_API_URLS:
             try:
-                params = {"uid": uid, "password": password}
-                response = requests.get(base_url, params=params, timeout=20)
-                if response.status_code == 200:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        if data.get("success") and "jwt_token" in data:
-                            return data["jwt_token"]
-                        if "jwt_token" in data:
-                            return data["jwt_token"]
-                        if "token" in data:
-                            return data["token"]
+                r = requests.get(base_url, params={"uid": uid, "password": password}, timeout=20)
+                if r.status_code == 200:
+                    d = r.json()
+                    if isinstance(d, dict):
+                        if d.get("success") and "jwt_token" in d:
+                            return d["jwt_token"]
+                        if "jwt_token" in d:
+                            return d["jwt_token"]
+                        if "token" in d:
+                            return d["token"]
             except Exception:
                 continue
         if attempt < retries:
             time.sleep(RETRY_DELAY)
     return None
-# =====================================================================
+# =============================================
 
 
-# ================= AUTO TOKEN REFRESH THREAD =================
+# ================= TOKEN REFRESHER =================
 def token_refresher_thread():
     while True:
-        print("=" * 60)
-        print(f"🔄 [AUTO REFRESH] Starting at {time.strftime('%H:%M:%S')}")
+        log("=" * 60)
+        log("🔄 [AUTO REFRESH] Starting")
+        REFRESH_INFO["last_start"] = time.strftime('%Y-%m-%d %H:%M:%S')
 
         if os.path.exists(INPUT_VISIT):
             try:
@@ -71,257 +107,355 @@ def token_refresher_thread():
                     accounts = json.load(f)
 
                 total = len(accounts)
-                print(f"📋 Total accounts: {total}")
-                print(f"⚙️  Threads: {THREAD_COUNT} | Batch delay: {BATCH_DELAY}s | Retry: {FETCH_RETRY}")
-                print("-" * 60)
+                log(f"📋 Total accounts: {total}")
+                log(f"⚙️  Threads: {THREAD_COUNT} | Batch delay: {BATCH_DELAY}s")
 
-                valid_tokens = []
-                failed_uids = []
+                valid_tokens, failed_uids = [], []
                 done = 0
-                start_time = time.time()
+                start = time.time()
 
                 for i in range(0, total, THREAD_COUNT):
                     batch = accounts[i:i + THREAD_COUNT]
-                    batch_num = i // THREAD_COUNT + 1
-                    total_batches = (total + THREAD_COUNT - 1) // THREAD_COUNT
-
-                    print(f"⏳ Batch {batch_num}/{total_batches} ({len(batch)} accounts)...")
-
-                    with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
-                        futures = {
-                            executor.submit(fetch_jwt, acc['uid'], acc['password']): acc
-                            for acc in batch
-                        }
-
-                        for future in as_completed(futures):
+                    with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
+                        futures = {ex.submit(fetch_jwt, a['uid'], a['password']): a for a in batch}
+                        for fut in as_completed(futures):
                             done += 1
-                            token = future.result()
-                            acc = futures[future]
-
-                            if token:
-                                valid_tokens.append({"token": token})
-                                status = "✅ OK  "
+                            tok = fut.result()
+                            acc = futures[fut]
+                            if tok:
+                                valid_tokens.append({"token": tok})
                             else:
                                 failed_uids.append(acc['uid'])
-                                status = "❌ FAIL"
-
-                            elapsed = time.time() - start_time
-                            rate = done / elapsed if elapsed > 0 else 0
-                            remaining = total - done
-                            eta = remaining / rate if rate > 0 else 0
-
-                            print(
-                                f"   [{done}/{total}] {status} uid {acc['uid']} "
-                                f"| OK: {len(valid_tokens)} | FAIL: {len(failed_uids)} "
-                                f"| ETA: {int(eta)}s"
-                            )
-
                     if i + THREAD_COUNT < total:
-                        print(f"   😴 Batch delay {BATCH_DELAY}s...")
                         time.sleep(BATCH_DELAY)
 
                 with open(OUTPUT_VISIT, 'w') as f:
                     json.dump(valid_tokens, f, indent=4)
 
-                elapsed_total = time.time() - start_time
-                print("-" * 60)
-                print(f"📊 [AUTO REFRESH] DONE in {elapsed_total:.1f}s")
-                print(f"   ✅ Success : {len(valid_tokens)}/{total}")
-                print(f"   ❌ Failed  : {len(failed_uids)}/{total}")
-                print(f"💾 Saved: {OUTPUT_VISIT}")
-                if failed_uids:
-                    print(f"⚠️  Failed UIDs: {failed_uids}")
-                print("=" * 60)
-
+                REFRESH_INFO.update({
+                    "last_end": time.strftime('%Y-%m-%d %H:%M:%S'),
+                    "success": len(valid_tokens),
+                    "failed": len(failed_uids),
+                    "total": total,
+                })
+                log(f"📊 REFRESH DONE — OK: {len(valid_tokens)}/{total} in {time.time()-start:.1f}s")
             except Exception as e:
-                print(f"❌ Refresh error: {e}")
+                log(f"❌ Refresh error: {e}")
         else:
-            print(f"⚠️ {INPUT_VISIT} not found")
+            log(f"⚠️ {INPUT_VISIT} not found")
 
-        next_time = time.strftime('%H:%M:%S', time.localtime(time.time() + REFRESH_INTERVAL))
-        print(f"😴 Sleeping 6 hours (next: {next_time})...")
+        log(f"😴 Sleeping {REFRESH_INTERVAL//3600}h...")
         time.sleep(REFRESH_INTERVAL)
-# =============================================================
 
-
-# Start refresher thread (daemon — server ke saath chalta hai)
 threading.Thread(target=token_refresher_thread, daemon=True).start()
+# =============================================
 
 
-# ================= LOAD TOKENS =================
+# ================= TOKEN LOAD =================
+def token_file(server_name):
+    if server_name == "IND":
+        return "token_ind.json"
+    if server_name in {"BR", "US", "SAC", "NA"}:
+        return "token_br.json"
+    return "token_bd.json"
+
 def load_tokens(server_name):
     try:
-        if server_name == "IND":
-            path = "token_ind.json"
-        elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br.json"
-        else:
-            path = "token_bd.json"
-
-        with open(path, "r") as f:
+        with open(token_file(server_name), "r") as f:
             data = json.load(f)
-
-        tokens = [item["token"] for item in data if "token" in item and item["token"] not in ["", "N/A"]]
-        return tokens
+        return [i["token"] for i in data if i.get("token") and i["token"] not in ("", "N/A")]
     except Exception as e:
-        app.logger.error(f"❌ Token load error for {server_name}: {e}")
+        log(f"❌ Token load error {server_name}: {e}")
         return []
-# ================================================
+# =============================================
 
 
 # ================= URL =================
 def get_url(server_name):
     if server_name == "IND":
         return "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
+    if server_name in {"BR", "US", "SAC", "NA"}:
         return "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
-    else:
-        return "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
-# ======================================
+    return "https://clientbp.ggblueshark.com/GetPlayerPersonalShow"
+# =======================================
 
 
-# ================= PROTOBUF PARSE =================
+# ================= PROTOBUF =================
 def parse_protobuf_response(response_data):
     try:
         info = Info()
         info.ParseFromString(response_data)
-        player_data = {
-            "uid": info.AccountInfo.UID if info.AccountInfo.UID else 0,
-            "nickname": info.AccountInfo.PlayerNickname if info.AccountInfo.PlayerNickname else "",
-            "likes": info.AccountInfo.Likes if info.AccountInfo.Likes else 0,
-            "region": info.AccountInfo.PlayerRegion if info.AccountInfo.PlayerRegion else "",
-            "level": info.AccountInfo.Levels if info.AccountInfo.Levels else 0
+        return {
+            "uid": info.AccountInfo.UID or 0,
+            "nickname": info.AccountInfo.PlayerNickname or "",
+            "likes": info.AccountInfo.Likes or 0,
+            "region": info.AccountInfo.PlayerRegion or "",
+            "level": info.AccountInfo.Levels or 0,
         }
-        return player_data
     except Exception as e:
-        app.logger.error(f"❌ Protobuf parsing error: {e}")
+        log(f"❌ Protobuf error: {e}")
         return None
-# =================================================
+# =============================================
 
 
-# ================= VISIT =================
-async def visit(session, url, token, uid, data):
-    headers = {
-        "ReleaseVersion": "OB55",
-        "X-GA": "v1 1",
-        "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0]
-    }
-    try:
-        async with session.post(url, headers=headers, data=data, ssl=False) as resp:
-            if resp.status == 200:
-                response_data = await resp.read()
-                return True, response_data
-            else:
-                return False, None
-    except Exception as e:
-        app.logger.error(f"❌ Visit error: {e}")
-        return False, None
-
-
-async def send_until_1000_success(tokens, uid, server_name, target_success=2000):
+# ================= VISIT CORE (FAST) =================
+async def send_until_target(tokens, uid, server_name, job_id, target_success=DEFAULT_TARGET):
     url = get_url(server_name)
-    connector = aiohttp.TCPConnector(limit=0)
+    host = url.replace("https://", "").split("/")[0]
+
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        limit_per_host=0,
+        ttl_dns_cache=600,
+        keepalive_timeout=CONN_KEEPALIVE,
+        enable_cleanup_closed=True,
+        force_close=False,
+        use_dns_cache=True,
+    )
+    sem = asyncio.Semaphore(VISIT_CONCURRENCY)
+
     total_success = 0
     total_sent = 0
-    first_success_response = None
+    first_response = None
     player_info = None
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession(connector=connector, timeout=VISIT_TIMEOUT) as session:
+        # pre-warm TLS + DNS
+        try:
+            await session.head(url, ssl=False, timeout=aiohttp.ClientTimeout(total=5))
+        except Exception:
+            pass
+
         encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
         data = bytes.fromhex(encrypted)
+        headers_base = {
+            "ReleaseVersion": "OB55",
+            "X-GA": "v1 1",
+            "Host": host,
+        }
 
-        while total_success < target_success:
-            batch_size = min(target_success - total_success, 2000)
-            tasks = [
-                asyncio.create_task(visit(session, url, tokens[(total_sent + i) % len(tokens)], uid, data))
-                for i in range(batch_size)
-            ]
-            results = await asyncio.gather(*tasks)
+        lock = asyncio.Lock()
+        stop_flag = {"stop": False}
 
-            if first_success_response is None:
-                for success, response in results:
-                    if success and response is not None:
-                        first_success_response = response
-                        player_info = parse_protobuf_response(response)
-                        break
+        def update_job():
+            with STATE_LOCK:
+                j = JOBS.get(job_id)
+                if j:
+                    j["sent"] = total_sent
+                    j["success"] = total_success
+                    j["fail"] = total_sent - total_success
 
-            batch_success = sum(1 for r, _ in results if r)
-            total_success += batch_success
-            total_sent += batch_size
+        async def worker(tok):
+            nonlocal total_success, total_sent, first_response, player_info
+            if stop_flag["stop"]:
+                return
+            async with sem:
+                if stop_flag["stop"]:
+                    return
+                headers = dict(headers_base)
+                headers["Authorization"] = f"Bearer {tok}"
+                ok = False
+                body = None
+                try:
+                    async with session.post(url, headers=headers, data=data, ssl=False) as r:
+                        if r.status == 200:
+                            body = await r.read()
+                            ok = True
+                except Exception:
+                    ok = False
 
-            print(f"Batch sent: {batch_size}, Success in batch: {batch_success}, Total success so far: {total_success}")
+                async with lock:
+                    total_sent += 1
+                    if ok:
+                        total_success += 1
+                        if first_response is None and body:
+                            first_response = body
+                            player_info = parse_protobuf_response(body)
+                        if total_success >= target_success:
+                            stop_flag["stop"] = True
+                    update_job()
 
-            # Infinite loop se bachne ke liye
-            if batch_success == 0:
-                print("⚠️ No success in batch, breaking")
-                break
+        tasks = []
+        for i in range(target_success):
+            tok = tokens[i % len(tokens)]
+            tasks.append(asyncio.create_task(worker(tok)))
 
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        update_job()
+
+    log(f"[{job_id[:8]}] DONE sent={total_sent} ok={total_success} target={target_success}")
     return total_success, total_sent, player_info
-# =========================================
+# =============================================
 
 
-# ================= ROUTES =================
-@app.route('/<string:server>/<int:uid>', methods=['GET'])
-def send_visits(server, uid):
-    server = server.upper()
+# ================= JOB RUNNER =================
+def _run_visit(server, uid, target):
     tokens = load_tokens(server)
-    target_success = 2000
-
     if not tokens:
-        return jsonify({"error": "❌ No valid tokens found", "owner": "@kamod_codex"}), 500
+        return jsonify({"error": "❌ No valid tokens", "server": server}), 500
 
-    print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
-    print(f"Waiting for total {target_success} successful visits...")
+    job_id = uuid.uuid4().hex
+    with STATE_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id, "uid": uid, "server": server,
+            "target": target, "sent": 0, "success": 0, "fail": 0,
+            "status": "running",
+            "started": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "finished": None, "player": None,
+        }
 
-    total_success, total_sent, player_info = asyncio.run(send_until_1000_success(
-        tokens, uid, server,
-        target_success=target_success
-    ))
+    log(f"🚀 JOB {job_id[:8]} uid={uid} server={server} target={target} tokens={len(tokens)}")
+
+    try:
+        total_success, total_sent, player_info = asyncio.run(
+            send_until_target(tokens, uid, server, job_id, target_success=target)
+        )
+    except Exception as e:
+        log(f"❌ JOB {job_id[:8]} error: {e}")
+        total_success = total_sent = 0
+        player_info = None
+
+    with STATE_LOCK:
+        j = JOBS[job_id]
+        j["status"] = "done" if player_info else "failed"
+        j["finished"] = time.strftime('%Y-%m-%d %H:%M:%S')
+        j["sent"] = total_sent
+        j["success"] = total_success
+        j["fail"] = total_sent - total_success
+        j["player"] = player_info
 
     if player_info:
-        player_info_response = {
-            "fail": target_success - total_success,
+        return jsonify({
+            "job_id": job_id,
+            "fail": target - total_success,
             "level": player_info.get("level", 0),
             "likes": player_info.get("likes", 0),
             "nickname": player_info.get("nickname", ""),
             "region": player_info.get("region", ""),
             "success": total_success,
+            "sent": total_sent,
             "uid": player_info.get("uid", 0),
             "owner": "@kamod_codex",
-            "channel": "@kamod_codex"
-        }
-        return jsonify(player_info_response), 200
-    else:
-        return jsonify({"error": "Could not decode player information", "owner": "@kamod_codex"}), 500
+            "channel": "@kamod_codex",
+        }), 200
+    return jsonify({"error": "decode failed", "job_id": job_id}), 500
+# =============================================
+
+
+# ================= ROUTES =================
+@app.route('/<string:server>/<int:uid>', methods=['GET'])
+def send_visits(server, uid):
+    return _run_visit(server.upper(), uid, DEFAULT_TARGET)
 
 
 @app.route('/visit', methods=['GET'])
 def send_visits_query():
-    """Query param style: /visit?uid=...&server_name=IND"""
-    from flask import request
     uid = request.args.get('uid')
     server = request.args.get('server_name', '').upper()
-
+    target = int(request.args.get('target', DEFAULT_TARGET))
     if not uid or not server:
-        return jsonify({"error": "uid and server_name required", "owner": "@kamod_codex"}), 400
-
+        return jsonify({"error": "uid and server_name required"}), 400
     try:
-        uid_int = int(uid)
+        uid = int(uid)
     except ValueError:
-        return jsonify({"error": "uid must be integer", "owner": "@kamod_codex"}), 400
+        return jsonify({"error": "uid must be integer"}), 400
+    return _run_visit(server, uid, target)
 
-    return send_visits(server, uid_int)
+
+@app.route('/status', methods=['GET'])
+@app.route('/status/<job_id>', methods=['GET'])
+def status(job_id=None):
+    with STATE_LOCK:
+        if job_id:
+            j = JOBS.get(job_id)
+            if not j:
+                return jsonify({"error": "job not found"}), 404
+            j2 = dict(j)
+            j2["uptime_s"] = int(time.time() - START_TIME)
+            return jsonify(j2), 200
+
+        active = [j for j in JOBS.values() if j["status"] == "running"]
+        jobs = list(JOBS.values())[-20:]
+        return jsonify({
+            "uptime_s": int(time.time() - START_TIME),
+            "active_jobs": len(active),
+            "total_jobs": len(JOBS),
+            "jobs": jobs,
+            "refresh": REFRESH_INFO,
+            "owner": "@kamod_codex",
+            "channel": "@kamod_codex",
+        }), 200
+
+
+@app.route('/port', methods=['GET'])
+def port_info():
+    return jsonify({
+        "port": 5000,
+        "host": "0.0.0.0",
+        "pid": os.getpid(),
+        "uptime_s": int(time.time() - START_TIME),
+        "python": sys.version.split()[0],
+        "owner": "@kamod_codex",
+        "channel": "@kamod_codex",
+    }), 200
+
+
+@app.route('/token', methods=['GET'])
+@app.route('/token/<server>', methods=['GET'])
+def token_info(server=None):
+    servers = [server.upper()] if server else ["IND", "BR", "US", "SAC", "NA", "BD"]
+    out = {}
+    for s in servers:
+        toks = load_tokens(s)
+        out[s] = {"count": len(toks), "file": token_file(s)}
+    return jsonify({
+        "tokens": out,
+        "refresh": REFRESH_INFO,
+        "owner": "@kamod_codex",
+        "channel": "@kamod_codex",
+    }), 200
+
+
+@app.route('/log', methods=['GET'])
+def log_info():
+    n = int(request.args.get('n', 100))
+    n = max(1, min(n, 200))
+    with LOG_LOCK:
+        lines = list(LOG_BUFFER)[-n:]
+    return jsonify({
+        "lines": lines,
+        "count": len(lines),
+        "owner": "@kamod_codex",
+        "channel": "@kamod_codex",
+    }), 200
+
+
+@app.route('/kill/<job_id>', methods=['GET'])
+def kill_job(job_id):
+    with STATE_LOCK:
+        j = JOBS.get(job_id)
+        if not j:
+            return jsonify({"error": "job not found"}), 404
+        j["status"] = "killed"
+        j["finished"] = time.strftime('%Y-%m-%d %H:%M:%S')
+    return jsonify({"killed": job_id}), 200
 # ==========================================
 
 
 if __name__ == "__main__":
-    print("💀 KAMOD WILL RISE - VISIT API 💀")
-    print("Owner   : @kamod_codex")
-    print("Channel : @kamod_codex")
-    print(f"⚙️  Threads: {THREAD_COUNT} | Batch delay: {BATCH_DELAY}s | Retry: {FETCH_RETRY}")
-    print("=" * 60)
-    app.run(host="0.0.0.0", port=5000)
+    try:
+        import uvloop
+        uvloop.install()
+        log("⚡ uvloop installed — max speed mode")
+    except ImportError:
+        log("⚠️ uvloop not installed (pip install uvloop for 2x boost)")
+
+    log("💀 KAMOD WILL RISE - VISIT API 💀")
+    log("Owner   : @kamod_codex")
+    log("Channel : @kamod_codex")
+    log(f"⚙️  Concurrency={VISIT_CONCURRENCY} | Target={DEFAULT_TARGET} | Refresh={REFRESH_INTERVAL//3600}h")
+    app.run(host="0.0.0.0", port=5000, threaded=True)
 
 # =====================================================
 # DEVILS WILL RISE - VISIT API
