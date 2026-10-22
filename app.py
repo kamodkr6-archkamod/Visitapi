@@ -21,7 +21,7 @@ app = Flask(__name__)
 # ================= CONFIG =================
 REFRESH_INTERVAL = 21600   # 6 hours
 THREAD_COUNT = 30          # 30 threads
-BATCH_DELAY = 1.5          # batch ke baad delay
+BATCH_DELAY = 1          # batch ke baad delay
 FETCH_RETRY = 2            # fail pe retry
 RETRY_DELAY = 3            # retry se pehle delay
 
@@ -219,7 +219,7 @@ async def visit(session, url, token, uid, data):
         return False, None
 
 
-async def send_until_1000_success(tokens, uid, server_name, target_success=1000):
+async def send_until_1000_success(tokens, uid, server_name, target_success=2000):
     url = get_url(server_name)
     connector = aiohttp.TCPConnector(limit=0)
     total_success = 0
@@ -232,7 +232,7 @@ async def send_until_1000_success(tokens, uid, server_name, target_success=1000)
         data = bytes.fromhex(encrypted)
 
         while total_success < target_success:
-            batch_size = min(target_success - total_success, 20000)
+            batch_size = min(target_success - total_success, 2000)
             tasks = [
                 asyncio.create_task(visit(session, url, tokens[(total_sent + i) % len(tokens)], uid, data))
                 for i in range(batch_size)
@@ -266,7 +266,7 @@ async def send_until_1000_success(tokens, uid, server_name, target_success=1000)
 def send_visits(server, uid):
     server = server.upper()
     tokens = load_tokens(server)
-    target_success = 1000
+    target_success = 2000
 
     if not tokens:
         return jsonify({"error": "❌ No valid tokens found", "owner": "@kamod_codex"}), 500
